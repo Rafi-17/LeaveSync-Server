@@ -9,8 +9,17 @@ const port = process.env.PORT || 5000;
 
 const admin = require("firebase-admin");
 
+let serviceAccount;
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    // Used when deployed on Render (reads the environment variable)
+    serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+} else {
+    // Used when running locally on your computer (reads your local JSON file)
+    serviceAccount = require("./leave-application-firebase-adminsdk.json");
+}
+
 admin.initializeApp({
-  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
+  credential: admin.credential.cert(serviceAccount)
 });
 
 //middleware
@@ -1017,7 +1026,7 @@ app.patch('/notifications/read-all/:email', verifyToken, async (req, res) => {
 
 
 //----------------CRON JOB API----------------------
-cron.schedule('1 10 * * *', async () => {
+cron.schedule('30 20 * * *', async () => {
     console.log('Running background maintenance tasks...');
     
     try {
