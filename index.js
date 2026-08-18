@@ -1168,6 +1168,17 @@ cron.schedule('58 0 * * *', async () => {
     timezone: "Asia/Dhaka" 
 });
 
+// Keep-alive endpoint to prevent Render from sleeping and keep MySQL connection warm
+app.get('/api/keep-alive', async (req, res) => {
+    try {
+        await pool.execute('SELECT 1');
+        res.status(200).json({ success: true, message: 'Server and MySQL DB are awake!' });
+    } catch (error) {
+        console.error('Keep-alive DB ping failed:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+});
+
 app.get('/', (req, res)=>{
     res.send("Leave application system running!")
 })
