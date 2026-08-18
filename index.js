@@ -700,7 +700,7 @@ app.patch('/leaveApplications/:id/chairman-action',verifyToken, verifyChairman, 
     }
 });
 
-// GET personal blocked dates for calendar (Own leaves + Accepted substitute duties)
+// GET personal blocked dates for calendar (Own leaves + Accepted substitute duties + Chairman Duties)
 app.get('/leaveApplications/blockedDates/:email', verifyToken, async (req, res) => {
     try {
         const email = req.params.email;
@@ -710,7 +710,8 @@ app.get('/leaveApplications/blockedDates/:email', verifyToken, async (req, res) 
         
         const userId = userRows[0].id;
 
-        const query = `
+        // Query 1: Leaves and Substitute Duties
+        const leaveQuery = `
             SELECT 
                 id as application_id, 
                 start_date, 
@@ -725,10 +726,24 @@ app.get('/leaveApplications/blockedDates/:email', verifyToken, async (req, res) 
                 OR 
                 (substitute_id = ? AND status IN ('PENDING_CHAIRMAN', 'APPROVED'))
         `;
+        const [leaveBlocks] = await pool.execute(leaveQuery, [userId, userId, userId, userId]);
         
-        const [blockedDates] = await pool.execute(query, [userId, userId, userId, userId]);
+        // Query 2: Authority Delegations (Acting Chairman Duty)
+        const delegationQuery = `
+            SELECT 
+                id as application_id,
+                start_date,
+                end_date,
+                'ACTING_CHAIRMAN' AS block_type
+            FROM authority_delegations
+            WHERE delegated_to = ? AND status IN ('SCHEDULED', 'ACTIVE')
+        `;
+        const [delegationBlocks] = await pool.execute(delegationQuery, [userId]);
+
+        // Combine both sets of blocked dates
+        const allBlockedDates = [...leaveBlocks, ...delegationBlocks];
         
-        res.status(200).json(blockedDates);
+        res.status(200).json(allBlockedDates);
 
     } catch (error) {
         console.error('Fetch Blocked Dates Error:', error);
@@ -819,7 +834,7 @@ app.get('/holidays', verifyToken, async (req, res) => {
 //-----------AUTHORITY DELEGATION API---------------
 
 // POST: Delegate Authority to a Teacher
-app.post('/delegateAuthority',verifyToken, verifyChairman, async (req, res) => {
+app.post('/delegateAuthority', verifyToken, verifyChairman, async (req, res) => {
     const connection = await pool.getConnection(); 
     
     try {
@@ -835,26 +850,43 @@ app.post('/delegateAuthority',verifyToken, verifyChairman, async (req, res) => {
         
         const delegatedBy = chairmanRows[0].id;
 
-        // NEW: Fetch the target teacher's email for notification
+        // Fetch the target teacher's email for notification
         const [targetRows] = await connection.execute('SELECT email FROM users WHERE id = ?', [delegatedTo]);
         const targetEmail = targetRows.length > 0 ? targetRows[0].email : null;
+
+        // Check if the start date is today or in the past
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        const delegationStart = new Date(startDate);
+        delegationStart.setHours(0, 0, 0, 0);
+
+        const isImmediate = delegationStart <= today;
+        const initialStatus = isImmediate ? 'ACTIVE' : 'SCHEDULED';
 
         const insertQuery = `
             INSERT INTO authority_delegations 
             (delegated_to, delegated_by, start_date, end_date, reason, status) 
-            VALUES (?, ?, ?, ?, ?, 'ACTIVE')
+            VALUES (?, ?, ?, ?, ?, ?)
         `;
-        await connection.execute(insertQuery, [delegatedTo, delegatedBy, startDate, endDate, reason]);
-        await connection.execute('UPDATE users SET role = "acting_chairman" WHERE id = ?', [delegatedTo]);
-
-        await connection.commit(); 
+        await connection.execute(insertQuery, [delegatedTo, delegatedBy, startDate, endDate, reason, initialStatus]);
         
-        // --- TRIGGER NOTIFICATION ---
-        if (targetEmail) {
-            await createNotification(targetEmail, 'AUTHORITY_DELEGATED', 'info', 'You have been granted Acting Chairman authority.', '/');
+        if (isImmediate) {
+            await connection.execute('UPDATE users SET role = "acting_chairman" WHERE id = ?', [delegatedTo]);
         }
 
-        res.status(201).json({ message: 'Authority delegated successfully.' });
+        await connection.commit(); 
+
+        if (isImmediate) {
+            if (targetEmail) {
+                await createNotification(targetEmail, 'AUTHORITY_DELEGATED', 'info', 'You have been granted Acting Chairman authority.', '/');
+            }
+            return res.status(201).json({ message: 'Authority delegated successfully and is active immediately.' });
+        } else {
+            if (targetEmail) {
+                await createNotification(targetEmail, 'AUTHORITY_SCHEDULED', 'info', `You are scheduled to receive Acting Chairman authority starting on ${startDate}.`, '/');
+            }
+            return res.status(201).json({ message: 'Authority delegation scheduled for the future.' });
+        }
 
     } catch (error) {
         await connection.rollback();
@@ -864,7 +896,6 @@ app.post('/delegateAuthority',verifyToken, verifyChairman, async (req, res) => {
         connection.release();
     }
 });
-
 // GET: Check for an active delegation
 app.get('/active-delegation',verifyToken, verifyChairman, async (req, res) => {
     try {
@@ -1026,7 +1057,7 @@ cron.schedule('1 10 * * *', async () => {
             // Send expiration notifications to EVERYONE involved!
             for (const leave of expiringLeaves) {
                 
-                // 1. Always notify the applicant their leave died
+                // notify the applicant their leave died
                 await createNotification(
                     leave.applicant_email,
                     'LEAVE_EXPIRED',
@@ -1035,7 +1066,7 @@ cron.schedule('1 10 * * *', async () => {
                     '/myRequests'
                 );
 
-                // 2. Notify the substitute 
+                // Notify the substitute 
                 if (leave.status === 'PENDING_SUBSTITUTE') {
                     // It expired before the substitute even answered
                     await createNotification(
@@ -1087,6 +1118,38 @@ cron.schedule('1 10 * * *', async () => {
                 );
             }
             console.log(`Successfully revoked acting_chairman authority for ${userIds.length} user(s).`);
+        }
+        // TASK 3: Auto-activate scheduled delegations
+        const findScheduledQuery = `
+            SELECT ad.id, ad.delegated_to, u.email 
+            FROM authority_delegations ad
+            JOIN users u ON ad.delegated_to = u.id
+            WHERE ad.status = 'SCHEDULED' AND ad.start_date <= CURDATE()
+        `;
+        const [scheduledDelegations] = await pool.execute(findScheduledQuery);
+
+        if (scheduledDelegations.length > 0) {
+            const activatedUserIds = scheduledDelegations.map(d => d.delegated_to);
+
+            // Mark the delegation as ACTIVE
+            await pool.execute(
+                `UPDATE authority_delegations SET status = 'ACTIVE' WHERE status = 'SCHEDULED' AND start_date <= CURDATE()`
+            );
+
+            for (const delegation of scheduledDelegations) {
+                // Grant the actual authority
+                await pool.execute(`UPDATE users SET role = 'acting_chairman' WHERE id = ?`, [delegation.delegated_to]);
+                
+                // Send activation notification
+                await createNotification(
+                    delegation.email,
+                    'AUTHORITY_ACTIVATED',
+                    'success',
+                    'Your scheduled Acting Chairman authority is now active.',
+                    '/'
+                );
+            }
+            console.log(`Successfully activated scheduled acting_chairman authority for ${activatedUserIds.length} user(s).`);
         }
 
     } catch (error) {
