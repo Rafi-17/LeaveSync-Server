@@ -8,10 +8,9 @@ const cron = require('node-cron');
 const port = process.env.PORT || 5000;
 
 const admin = require("firebase-admin");
-const serviceAccount = require("./leave-application-firebase-adminsdk.json"); // Keep this file out of GitHub!
 
 admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount)
+  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT))
 });
 
 //middleware
