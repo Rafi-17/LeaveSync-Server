@@ -1026,7 +1026,7 @@ app.patch('/notifications/read-all/:email', verifyToken, async (req, res) => {
 
 
 //----------------CRON JOB API----------------------
-cron.schedule('58 0 * * *', async () => {
+cron.schedule('1 10 * * *', async () => {
     console.log('Running background maintenance tasks...');
     
     try {
