@@ -195,7 +195,7 @@ app.get('/users/substitutes', verifyToken, async (req, res) => {
 });
 
 //post users
-app.post('/users', verifyToken, async (req, res) => {
+app.post('/users', async (req, res) => {
     try {
         const { name, email, department, designation } = req.body;
 
@@ -325,6 +325,42 @@ app.get('/leaveApplications/substitute/:email', verifyToken, async (req, res) =>
     } catch (error) {
         console.error('Fetch Substitute Requests Error:', error);
         res.status(500).json({ message: 'Failed to fetch requests.' });
+    }
+});
+
+// Withdraw/Delete an application
+app.delete('/leaveApplications/:id', verifyToken, async (req, res) => {
+    try {
+        const applicationId = req.params.id;
+        
+        const [appRows] = await pool.execute(`
+            SELECT sub.email as substitute_email, app.name as applicant_name
+            FROM leave_applications la
+            JOIN users sub ON la.substitute_id = sub.id
+            JOIN users app ON la.applicant_id = app.id
+            WHERE la.id = ?
+        `, [applicationId]);
+
+        const [result] = await pool.execute('DELETE FROM leave_applications WHERE id = ?', [applicationId]);
+        
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ message: 'Application not found.' });
+        }
+
+        if (appRows.length > 0 && appRows[0].substitute_email) {
+            await createNotification(
+                appRows[0].substitute_email,
+                'REQUEST_WITHDRAWN',
+                'info', // This will style it nicely in your frontend
+                `${appRows[0].applicant_name} has withdrawn their leave and canceled the substitute request.`,
+                '/substituteRequests'
+            );
+        }
+        
+        res.status(200).json({ message: 'Application deleted successfully.' });
+    } catch (error) {
+        console.error('Delete Application Error:', error);
+        res.status(500).json({ message: 'Failed to delete application.' });
     }
 });
 
@@ -585,19 +621,31 @@ app.put('/leaveApplications/:id', verifyToken, async (req, res) => {
 });
 
 // accept or reject application by a substitute
+// accept or reject application by a substitute
 app.patch('/leaveApplications/:id/substitute-action', verifyToken, async (req, res) => {
+    // We use a connection transaction since we might need to deduct quotas
+    const connection = await pool.getConnection(); 
+    
     try {
+        await connection.beginTransaction();
         const applicationId = req.params.id;
         const { action } = req.body;
+        
+        // Securely get the email of the substitute clicking the button
+        const substituteEmail = req.decodedUser.email;
 
-        const [appRows] = await pool.execute(`
-            SELECT la.start_date, u.email as applicant_email 
+        // 1. Fetch application details
+        const [appRows] = await connection.execute(`
+            SELECT la.start_date, la.total_days, la.applicant_id, u.email as applicant_email 
             FROM leave_applications la
             JOIN users u ON la.applicant_id = u.id
             WHERE la.id = ?
         `, [applicationId]);
         
-        if (appRows.length === 0) return res.status(404).json({ message: 'Application not found.' });
+        if (appRows.length === 0) {
+            await connection.rollback();
+            return res.status(404).json({ message: 'Application not found.' });
+        }
 
         const application = appRows[0];
         const currentTime = new Date(); 
@@ -606,23 +654,56 @@ app.patch('/leaveApplications/:id/substitute-action', verifyToken, async (req, r
         const startDate = new Date(application.start_date);
         startDate.setHours(0,0,0,0); 
 
+        // 2. Check Expiration deadlines
         if (action === 'accept') {
             let isExpired = false;
             if (todayAtMidnight > startDate) isExpired = true;
             else if (todayAtMidnight.getTime() === startDate.getTime() && currentTime.getHours() >= 10) isExpired = true;
 
-            if (isExpired) return res.status(400).json({ message: 'The deadline for this leave has passed.' });
+            if (isExpired) {
+                await connection.rollback();
+                return res.status(400).json({ message: 'The deadline for this leave has passed.' });
+            }
         }
 
+        // 3. Find out the role of the substitute answering the request
+        const [subRows] = await connection.execute('SELECT role FROM users WHERE email = ?', [substituteEmail]);
+        const substituteRole = subRows.length > 0 ? subRows[0].role : 'teacher';
+
         let newStatus = '';
-        if (action === 'accept') newStatus = 'PENDING_CHAIRMAN';
-        else if (action === 'reject') newStatus = 'REJECTED_BY_SUBSTITUTE';
-        else return res.status(400).json({ message: 'Invalid action.' });
-
-        await pool.execute('UPDATE leave_applications SET status = ? WHERE id = ?', [newStatus, applicationId]);
-
-        // --- TRIGGER NOTIFICATION ---
+        
+        // 4. THE NEW LOGIC: Route based on substitute's role
         if (action === 'accept') {
+            if (substituteRole === 'chairman' || substituteRole === 'acting_chairman') {
+                // If Chairman accepts, bypass the queue and approve immediately!
+                newStatus = 'APPROVED';
+                
+                // Deduct the leave quota from the applicant immediately
+                await connection.execute(
+                    'UPDATE users SET leave_quota = leave_quota - ? WHERE id = ?', 
+                    [application.total_days, application.applicant_id]
+                );
+            } else {
+                // Regular teachers still go to the Chairman's queue
+                newStatus = 'PENDING_CHAIRMAN';
+            }
+        } 
+        else if (action === 'reject') {
+            newStatus = 'REJECTED_BY_SUBSTITUTE';
+        } 
+        else {
+            await connection.rollback();
+            return res.status(400).json({ message: 'Invalid action.' });
+        }
+
+        // 5. Save the new status
+        await connection.execute('UPDATE leave_applications SET status = ? WHERE id = ?', [newStatus, applicationId]);
+        await connection.commit();
+
+        // 6. TRIGGER DYNAMIC NOTIFICATIONS
+        if (newStatus === 'APPROVED') {
+            await createNotification(application.applicant_email, 'LEAVE_APPROVED', 'success', 'Your substitute is the Chairman and has directly approved your leave!', '/myRequests');
+        } else if (newStatus === 'PENDING_CHAIRMAN') {
             await createNotification(application.applicant_email, 'SUBSTITUTE_ACCEPTED', 'success', 'Your substitute accepted your request. Pending Chairman approval.', '/myRequests');
         } else if (action === 'reject') {
             await createNotification(application.applicant_email, 'SUBSTITUTE_REJECTED', 'error', 'Your substitute rejected your leave request.', '/myRequests');
@@ -631,8 +712,11 @@ app.patch('/leaveApplications/:id/substitute-action', verifyToken, async (req, r
         res.status(200).json({ message: `Application ${action}ed successfully.`, status: newStatus });
 
     } catch (error) {
+        if (connection) await connection.rollback();
         console.error('Update Application Error:', error);
         res.status(500).json({ message: 'Failed to update application status.' });
+    } finally {
+        if (connection) connection.release();
     }
 });
 
@@ -818,6 +902,38 @@ app.get('/stats/chairman', verifyToken, verifyChairman, async (req, res) => {
     }
 });
 
+// GET Chairman Department Status (For Calendar and Teacher List)
+app.get('/stats/department-status', verifyToken, verifyChairman, async (req, res) => {
+    try {
+        // 1. Fetch all users (teachers) in the department
+        const [teachers] = await pool.execute(`
+            SELECT id, name, email, department, designation, leave_quota, role 
+            FROM users 
+            ORDER BY name ASC
+        `);
+
+        // 2. Fetch all relevant leave applications (Approved and Pending)
+        const [leaves] = await pool.execute(`
+            SELECT 
+                la.*, 
+                app.name AS applicant_name, 
+                app.email AS applicant_email, 
+                sub.name AS substitute_name
+            FROM leave_applications la
+            JOIN users app ON la.applicant_id = app.id
+            LEFT JOIN users sub ON la.substitute_id = sub.id
+            WHERE la.status IN ('PENDING_SUBSTITUTE', 'PENDING_CHAIRMAN', 'APPROVED')
+            ORDER BY la.start_date DESC
+        `);
+
+        res.status(200).json({ teachers, leaves });
+
+    } catch (error) {
+        console.error('Fetch Department Status Error:', error);
+        res.status(500).json({ message: 'Failed to fetch department calendar data.' });
+    }
+});
+
 //-----------HOLIDAY RELATED API---------------
 
 //get holidays
@@ -965,7 +1081,7 @@ app.post('/revoke-delegation/:id',verifyToken, verifyChairman, async (req, res) 
     }
 });
 
-// --- NOTIFICATIONS API ---
+// ------------ NOTIFICATIONS API --------------
 
 app.get('/notifications/:email', verifyToken, async (req, res) => {
     try {
