@@ -634,9 +634,9 @@ app.patch('/leaveApplications/:id/substitute-action', verifyToken, async (req, r
         // Securely get the email of the substitute clicking the button
         const substituteEmail = req.decodedUser.email;
 
-        // 1. Fetch application details
+        // Fetch application details
         const [appRows] = await connection.execute(`
-            SELECT la.start_date, la.total_days, la.applicant_id, u.email as applicant_email 
+            SELECT la.start_date, la.total_days, la.applicant_id, u.email as applicant_email, u.name as applicant_name 
             FROM leave_applications la
             JOIN users u ON la.applicant_id = u.id
             WHERE la.id = ?
@@ -654,7 +654,7 @@ app.patch('/leaveApplications/:id/substitute-action', verifyToken, async (req, r
         const startDate = new Date(application.start_date);
         startDate.setHours(0,0,0,0); 
 
-        // 2. Check Expiration deadlines
+        // Check Expiration deadlines
         if (action === 'accept') {
             let isExpired = false;
             if (todayAtMidnight > startDate) isExpired = true;
@@ -666,13 +666,13 @@ app.patch('/leaveApplications/:id/substitute-action', verifyToken, async (req, r
             }
         }
 
-        // 3. Find out the role of the substitute answering the request
+        // Find out the role of the substitute answering the request
         const [subRows] = await connection.execute('SELECT role FROM users WHERE email = ?', [substituteEmail]);
         const substituteRole = subRows.length > 0 ? subRows[0].role : 'teacher';
 
         let newStatus = '';
         
-        // 4. THE NEW LOGIC: Route based on substitute's role
+        // Route based on substitute's role
         if (action === 'accept') {
             if (substituteRole === 'chairman' || substituteRole === 'acting_chairman') {
                 // If Chairman accepts, bypass the queue and approve immediately!
@@ -696,15 +696,38 @@ app.patch('/leaveApplications/:id/substitute-action', verifyToken, async (req, r
             return res.status(400).json({ message: 'Invalid action.' });
         }
 
-        // 5. Save the new status
+        // Save the new status
         await connection.execute('UPDATE leave_applications SET status = ? WHERE id = ?', [newStatus, applicationId]);
         await connection.commit();
 
-        // 6. TRIGGER DYNAMIC NOTIFICATIONS
+        // TRIGGER DYNAMIC NOTIFICATIONS
         if (newStatus === 'APPROVED') {
             await createNotification(application.applicant_email, 'LEAVE_APPROVED', 'success', 'Your substitute is the Chairman and has directly approved your leave!', '/myRequests');
         } else if (newStatus === 'PENDING_CHAIRMAN') {
-            await createNotification(application.applicant_email, 'SUBSTITUTE_ACCEPTED', 'success', 'Your substitute accepted your request. Pending Chairman approval.', '/myRequests');
+            // Notify the Applicant that substitute accepted
+            await createNotification(
+                application.applicant_email, 
+                'SUBSTITUTE_ACCEPTED', 
+                'success', 
+                'Your substitute accepted your request. Pending Chairman approval.', 
+                '/myRequests'
+            );
+
+            // Fetch all active Chairman and Acting Chairman emails
+            const [chairmanRows] = await connection.execute(`
+                SELECT email FROM users WHERE role IN ('chairman', 'acting_chairman')
+            `);
+
+            // Dispatch notification to the Chairman / Acting Chairman
+            for (const chairman of chairmanRows) {
+                await createNotification(
+                    chairman.email,
+                    'PENDING_CHAIRMAN_APPROVAL',
+                    'warning',
+                    `${application.applicant_name}'s leave request was accepted by the substitute and requires your approval.`,
+                    '/pendingApprovals'
+                );
+            }
         } else if (action === 'reject') {
             await createNotification(application.applicant_email, 'SUBSTITUTE_REJECTED', 'error', 'Your substitute rejected your leave request.', '/myRequests');
         }
